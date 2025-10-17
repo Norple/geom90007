@@ -9,13 +9,9 @@ library(stringr)
 library(tidyr)
 library(lubridate)
 library(sf)
-library(leaflet)
-library(leaflet.extras)
 library(htmltools)
 library(FNN)
 library(geosphere)
-library(ggplot2)
-library(plotly)
 
 # ---------- 工具函数：鲁棒获取经纬度 ----------
 pick_lonlat <- function(df) {
@@ -61,17 +57,17 @@ safe_read <- function(path, type_tag, subtype_tag = NULL) {
   }
   
   result <- tibble(
-    id = coalesce(df$id, df$ID, df$`OBJECTID`, df$prop_id, df$KerbsideID, 1:nrow(df)),
-    name = as.character(coalesce(nm, paste0(type_tag, " #", 1:nrow(df)))),
+    id = coalesce(df$id, df$ID, df$`OBJECTID`, df$prop_id, df$KerbsideID, seq_len(nrow(df))),
+    name = as.character(coalesce(nm, paste0(type_tag, " #", seq_len(nrow(df))))),
     type = type_tag,
     subtype = subtype_tag %||% "",
     capacity = capacity,
     lon = ll$lon, 
     lat = ll$lat
-  ) |> filter(is.finite(lon), is.finite(lat))
+  ) |> filter(is.finite(.data$lon), is.finite(.data$lat))
   
   # 重新分配ID以确保唯一性
-  result$id <- 1:nrow(result)
+  result$id <- seq_len(nrow(result))
   result
 }
 
@@ -91,6 +87,22 @@ fountains <- safe_read("drinking-fountains.csv", "amenity", "fountain")
 # 街道家具（用于计算街区便利性）
 street_furniture <- safe_read("street-furniture-including-bollards-bicycle-rails-bins-drinking-fountains-horse-.csv", "street_furniture", "furniture")
 
+# 为街道家具添加特殊地点类型信息
+if (!is.null(street_furniture)) {
+  # 读取原始数据获取ASSET_TYPE信息
+  street_furniture_raw <- suppressMessages(suppressWarnings(readr::read_csv("street-furniture-including-bollards-bicycle-rails-bins-drinking-fountains-horse-.csv", show_col_types = FALSE)))
+  
+  # 合并ASSET_TYPE信息
+  street_furniture <- street_furniture |>
+    mutate(
+      special_place_type = if (nrow(street_furniture_raw) >= nrow(street_furniture)) {
+        street_furniture_raw$ASSET_TYPE[seq_len(nrow(street_furniture))]
+      } else {
+        rep("Unknown", nrow(street_furniture))
+      }
+    )
+}
+
 # 停车数据
 parking <- safe_read("on-street-parking-bay-sensors.csv", "parking", "bay")
 
@@ -104,8 +116,8 @@ pedestrian_data <- tryCatch({
       count = total_of_directions
     ) |>
     filter(!is.na(hour), !is.na(count)) |>
-    group_by(sensor_id = location_id, hour) |>
-    summarise(count = sum(count, na.rm = TRUE), .groups = "drop") |>
+    group_by(sensor_id = .data$Location_ID, hour) |>
+    summarise(count = sum(.data$count, na.rm = TRUE), .groups = "drop") |>
     filter(count > 0)
 }, error = function(e) {
   cat("行人计数数据加载失败:", e$message, "\n")
@@ -210,6 +222,13 @@ ui <- fluidPage(
   useShinyjs(),
   titlePanel("Melbourne Vibe Finder - 墨尔本氛围探索器"),
   
+  # 添加应用描述
+  div(style = "background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 10px; margin-bottom: 20px;",
+      h3("🗺️ 探索墨尔本全城氛围", style = "margin: 0 0 10px 0;"),
+      p("发现墨尔本各区域的独特氛围，从CBD的繁华到圣基尔达的海滨风情。选择您感兴趣的氛围标签，探索整个城市的精彩地点！", 
+        style = "margin: 0; font-size: 1.1em;")
+  ),
+  
   # 自定义CSS
   tags$head(
     tags$style(HTML("
@@ -235,70 +254,133 @@ ui <- fluidPage(
         border-radius: 5px;
         border-left: 3px solid #2196f3;
       }
-    "))
+    ")),
+    tags$script(src = "https://public.tableau.com/javascripts/api/tableau-2.min.js"),
+    tags$script(src = "tableau_shiny.js")
   ),
   
-  sidebarLayout(
-    sidebarPanel(
-      width = 3,
+  fluidRow(
+    # 左侧过滤器面板
+    column(3,
+      div(style = "background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); height: 100vh; overflow-y: auto;",
+        
+        # 主要POI类型选择（基于Tableau图例）
+        h4("📍 Main POI Types", style = "color: #2c3e50; margin-bottom: 15px;"),
+        checkboxGroupInput("main_poi_types", "Select Main POI Types", 
+                          choices = list(
+                            "Cafe/Restaurant" = "cafe_restaurant",
+                            "Bar/Nightclub" = "bar_pub", 
+                            "Landmark" = "landmark",
+                            "Event Venue" = "venue",
+                            "Drinking Fountain" = "drinking_fountain",
+                            "Toilet" = "toilet"
+                          ),
+                          selected = c("cafe_restaurant", "bar_pub", "landmark"),
+                          width = "100%"),
       
       # 氛围选择
-      h4("🎭 选择氛围标签", style = "color: #2c3e50;"),
-      checkboxGroupInput("vibes", "", 
+        h4("🎭 氛围标签", style = "color: #2c3e50; margin-top: 25px; margin-bottom: 15px;"),
+        checkboxGroupInput("vibes", "选择氛围标签", 
                         choices = vibe_labels, 
                         selected = c("vibe_artistic", "vibe_foodie"),
                         width = "100%"),
       
       # 时间选择
-      h4("⏰ 计划时段", style = "color: #2c3e50; margin-top: 20px;"),
+        h4("⏰ 计划时段", style = "color: #2c3e50; margin-top: 25px; margin-bottom: 15px;"),
       sliderInput("hour", "", 
                  min = 6, max = 23, value = 14, step = 1,
                  ticks = TRUE),
       
+        # 区域选择
+        h4("🗺️ Explore Region", style = "color: #2c3e50; margin-top: 25px; margin-bottom: 15px;"),
+        selectInput("explore_region", "Select Explore Region", 
+                   choices = list(
+                     "Entire Melbourne" = "all",
+                     "Melbourne CBD" = "cbd", 
+                     "Southbank" = "southbank",
+                     "Carlton" = "carlton",
+                     "Fitzroy" = "fitzroy",
+                     "St Kilda" = "st_kilda"
+                   ),
+                   selected = "all"),
+        
       # 便利设施要求
-      h4("🏪 便利设施要求", style = "color: #2c3e50; margin-top: 20px;"),
+        h4("🏪 便利设施要求", style = "color: #2c3e50; margin-top: 25px; margin-bottom: 15px;"),
       checkboxInput("need_facilities", "需要附近有饮水点/公厕", value = FALSE),
       checkboxInput("avoid_crowd", "避开拥挤时段", value = FALSE),
       
-      # 距离限制
-      h4("🚶 步行距离", style = "color: #2c3e50; margin-top: 20px;"),
-      sliderInput("max_distance", "最大步行距离 (米)", 
-                 min = 200, max = 1000, value = 500, step = 100),
-      
-      # 控制按钮
-      actionButton("clear_route", "🗑️ 清空行程", 
-                  class = "btn-warning", style = "width: 100%; margin-top: 10px;"),
-      actionButton("optimize_route", "🎯 优化路线", 
-                  class = "btn-success", style = "width: 100%; margin-top: 5px;")
+        
+        
+        # 显示选项
+        h4("👁️ 显示选项", style = "color: #2c3e50; margin-top: 25px; margin-bottom: 15px;"),
+        checkboxInput("show_heatmap", "显示人流热力图", value = FALSE),
+        checkboxInput("show_density", "显示POI密度", value = TRUE),
+        sliderInput("poi_limit", "显示POI数量限制", 
+                   min = 50, max = 500, value = 200, step = 50),
+        
+        # Tableau集成
+        h4("📊 Tableau集成", style = "color: #2c3e50; margin-top: 25px; margin-bottom: 15px;"),
+        actionButton("connect_tableau", "🔗 连接Tableau仪表板", 
+                   class = "btn btn-info", style = "width: 100%; margin-bottom: 10px;"),
+        
+        # 数据导出按钮
+        actionButton("export_data", "📥 导出数据到Tableau", 
+                    class = "btn btn-success", style = "width: 100%; margin-bottom: 10px;"),
+        actionButton("generate_tableau", "📈 生成Tableau报告", 
+                    class = "btn btn-primary", style = "width: 100%; margin-bottom: 10px;"),
+        
+        # 数据统计
+        h4("📊 数据统计", style = "color: #2c3e50; margin-top: 25px; margin-bottom: 15px;"),
+        div(id = "data_stats", class = "info-card", 
+            "选择过滤器查看数据统计")
+      )
     ),
     
-    mainPanel(
-      width = 9,
-      
-      # 地图区域
-      div(style = "height: 500px; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);",
-          leafletOutput("map", height = "100%")
-      ),
-      
-      # 信息面板
-      fluidRow(
-        column(6,
-          h4("📍 行程列表", style = "color: #2c3e50; margin-top: 20px;"),
-          div(id = "route_list", style = "max-height: 300px; overflow-y: auto;")
+    # 右侧Tableau工作区
+    column(9,
+      div(style = "background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); height: 100vh;",
+        
+        # Tableau工作区标题
+        h3("📊 Tableau数据分析工作区", style = "color: #2c3e50; margin-bottom: 20px; text-align: center;"),
+        
+        # Tableau仪表板嵌入区域
+        div(
+          id = "tableau_dashboard", 
+          style = "height: 80vh; border: 2px dashed #ddd; border-radius: 10px; background: #f8f9fa; position: relative;",
+          div(id = "tableauViz", style = "height: 100%; width: 100%; display: none;"),
+          HTML('
+            <div id="tableau_placeholder"
+                 style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 20px;">
+              <div style="margin-bottom: 30px;">
+                <h4 style="color: #6c757d; margin-bottom: 15px;">🔗 Tableau仪表板工作区</h4>
+                <p style="color: #6c757d; margin-bottom: 20px; font-size: 1.1em;">
+                  首次加载可能需要几秒钟，请稍候…
+                </p>
+              </div>
+              <div style="background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); max-width: 420px;">
+                <h5 style="color: #2c3e50; margin-bottom: 15px;">📋 使用说明</h5>
+                <div style="text-align: left; color: #6c757d;">
+                  <p style="margin: 10px 0;"><strong>自动加载:</strong></p>
+                  <ol style="margin: 5px 0 15px 20px;">
+                    <li>页面打开后会自动连接Tableau仪表板</li>
+                    <li>左侧筛选会通过API自动同步到仪表板</li>
+                  </ol>
+                  <p style="margin: 10px 0;"><strong>手动刷新:</strong></p>
+                  <ol style="margin: 5px 0 15px 20px;">
+                    <li>若仪表板未显示，可点击“连接Tableau仪表板”按钮</li>
+                    <li>稍等片刻直至仪表板加载完成</li>
+                  </ol>
+                </div>
+              </div>
+            </div>'
+          )
         ),
-        column(6,
-          h4("📊 地点详情", style = "color: #2c3e50; margin-top: 20px;"),
-          div(id = "poi_details", class = "info-card", 
-              "点击地图上的标记查看详细信息")
+        
+        # 底部说明
+        div(style = "margin-top: 15px; text-align: center;",
+            p("💡 提示：导出数据后，您可以在Tableau中创建专业的地图可视化、热力图和交互式仪表板", 
+              style = "color: #6c757d; font-style: italic;")
         )
-      ),
-      
-      # 数据分析区域
-      h4("📈 周边设施分析", style = "color: #2c3e50; margin-top: 20px;"),
-      div(style = "background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);",
-          plotlyOutput("facility_chart", height = "400px"),
-          p("💡 显示选中地点的周边设施分布情况", 
-            style = "text-align: center; color: #6c757d; margin-top: 10px;")
       )
     )
   )
@@ -306,11 +388,59 @@ ui <- fluidPage(
 
 # ---------- 服务器逻辑 ----------
 server <- function(input, output, session) {
+  session$onFlushed(function() {
+    session$sendCustomMessage("tableauInit", list(forceReload = FALSE))
+  }, once = TRUE)
+  
+  # 定义墨尔本各区域边界
+  region_bounds <- list(
+    all = list(lat_min = -37.9, lat_max = -37.7, lon_min = 144.9, lon_max = 145.0),
+    cbd = list(lat_min = -37.82, lat_max = -37.80, lon_min = 144.95, lon_max = 144.98),
+    southbank = list(lat_min = -37.83, lat_max = -37.81, lon_min = 144.96, lon_max = 144.99),
+    carlton = list(lat_min = -37.81, lat_max = -37.79, lon_min = 144.96, lon_max = 144.99),
+    fitzroy = list(lat_min = -37.80, lat_max = -37.78, lon_min = 144.97, lon_max = 145.00),
+    st_kilda = list(lat_min = -37.87, lat_max = -37.85, lon_min = 144.97, lon_max = 145.00)
+  )
+  
+  
   
   # 过滤POI数据
   filtered_poi <- reactive({
     req(input$vibes)
+    
+    
     dat <- poi
+    
+    # 根据选择的区域过滤
+    if (input$explore_region != "all") {
+      bounds <- region_bounds[[input$explore_region]]
+      dat <- dat |>
+        filter(
+          .data$lat >= bounds$lat_min & .data$lat <= bounds$lat_max &
+          .data$lon >= bounds$lon_min & .data$lon <= bounds$lon_max
+        )
+    }
+    
+    # 根据主要POI类型过滤
+    if (length(input$main_poi_types) > 0) {
+      # 应用类型过滤
+      if (any(input$main_poi_types %in% c("cafe_restaurant", "bar_pub", "landmark", "venue", "drinking_fountain", "toilet"))) {
+        dat <- dat |>
+          filter(
+            Reduce("|", lapply(input$main_poi_types, function(t) {
+              case_when(
+                t == "cafe_restaurant" ~ .data$type %in% c("cafe", "restaurant"),
+                t == "bar_pub" ~ .data$type %in% c("bar", "pub"),
+                t == "landmark" ~ .data$type == "landmark",
+                t == "venue" ~ .data$type == "venue",
+                t == "drinking_fountain" ~ .data$type == "fountain",
+                t == "toilet" ~ .data$type == "toilet",
+                TRUE ~ FALSE
+              )
+            }))
+          )
+      }
+    }
     
     # 根据选择的氛围标签过滤
     if (length(input$vibes) > 0) {
@@ -325,6 +455,7 @@ server <- function(input, output, session) {
         dat <- dat[keep,]
       }
     }
+    
     
     # 便利设施要求
     if (isTRUE(input$need_facilities)) {
@@ -341,366 +472,222 @@ server <- function(input, output, session) {
       # 暂时跳过，因为需要传感器位置数据
     }
     
+    # 限制显示数量
+    if (nrow(dat) > input$poi_limit) {
+      # 按便利性评分排序，优先显示评分高的
+      dat <- dat |>
+        arrange(desc(.data$street_density)) |>
+        head(input$poi_limit)
+    }
+    
     dat
   })
   
-  # 生成热力图数据
-  heatmap_data <- reactive({
-    if (is.null(pedestrian_data)) return(NULL)
-    
-    # 根据选择的时间过滤行人数据
-    target_hour <- input$hour
-    ped_filtered <- pedestrian_data |>
-      filter(hour(hour) == target_hour) |>
-      group_by(sensor_id) |>
-      summarise(avg_count = mean(count, na.rm = TRUE), .groups = "drop")
-    
-    # 这里需要传感器位置数据来生成热力图
-    # 暂时使用POI位置作为示例
-    if (nrow(ped_filtered) > 0) {
-      sample_poi <- poi[sample(nrow(poi), min(50, nrow(poi))),]
-      return(sample_poi[, c("lon", "lat")])
-    }
-    return(NULL)
-  })
-  
-  # 行程管理
-  route <- reactiveVal(data.frame(
-    name = character(), 
-    lon = numeric(), 
-    lat = numeric(), 
-    type = character(),
-    stringsAsFactors = FALSE
-  ))
-  
-  # 清空行程
-  observeEvent(input$clear_route, {
-    route(data.frame(name = character(), lon = numeric(), lat = numeric(), type = character()))
-  })
-  
-  # 优化路线（简单的距离优化）
-  observeEvent(input$optimize_route, {
-    r <- route()
-    if (nrow(r) <= 2) return()
-    
-    # 简单的TSP近似算法
-    n <- nrow(r)
-    if (n > 1) {
-      # 计算距离矩阵
-      dist_matrix <- matrix(0, n, n)
-      for (i in 1:n) {
-        for (j in 1:n) {
-          if (i != j) {
-            dist_matrix[i, j] <- geosphere::distHaversine(
-              c(r$lon[i], r$lat[i]), 
-              c(r$lon[j], r$lat[j])
-            )
-          }
-        }
-      }
-      
-      # 简单的最近邻算法
-      if (n > 2) {
-        new_order <- c(1)
-        remaining <- 2:n
-        
-        while (length(remaining) > 0) {
-          last <- new_order[length(new_order)]
-          next_idx <- remaining[which.min(dist_matrix[last, remaining])]
-          new_order <- c(new_order, next_idx)
-          remaining <- remaining[remaining != next_idx]
-        }
-        
-        route(r[new_order,])
-      }
-    }
-  })
-  
-  # 渲染地图
-  output$map <- renderLeaflet({
-    leaflet() |>
-      addProviderTiles("CartoDB.Positron") |>
-      setView(144.9631, -37.8136, zoom = 14) |>
-      addControl(
-        html = "<div style='background: white; padding: 5px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);'>
-                <strong>Melbourne Vibe Finder</strong><br>
-                <small>点击标记添加到行程</small>
-                </div>",
-        position = "topright"
-      )
-  })
-  
-  # 更新地图标记
+  # 数据统计显示
   observe({
-    dat <- filtered_poi()
-    if (nrow(dat) == 0) return()
-    
-    # 创建颜色映射
-    type_colors <- c(
-      "cafe_restaurant" = "#e74c3c",
-      "bar_pub" = "#8e44ad", 
-      "landmark" = "#f39c12",
-      "venue" = "#2ecc71",
-      "amenity" = "#3498db",
-      "street_furniture" = "#95a5a6",
-      "parking" = "#34495e"
-    )
-    
-    pal <- colorFactor(type_colors, levels = unique(dat$type))
-    
-    # 创建弹出窗口内容
-    popup_content <- paste0(
-      "<div style='min-width: 200px;'>",
-      "<h4 style='color: #2c3e50; margin: 0 0 10px 0;'>", htmlEscape(dat$name), "</h4>",
-      "<p><strong>类型:</strong> ", htmlEscape(dat$type), "</p>",
-      if (!is.na(dat$capacity[1])) paste0("<p><strong>容量:</strong> ", dat$capacity, "</p>") else "",
-      "<p><strong>氛围标签:</strong><br>",
-      paste(ifelse(dat$vibe_artistic, "🎨 文艺午后", ""), 
-            ifelse(dat$vibe_foodie, "🍽️ 美食探索", ""),
-            ifelse(dat$vibe_historical, "🏛️ 历史漫步", ""),
-            ifelse(dat$vibe_nightlife, "🌃 夜生活热点", ""),
-            ifelse(dat$vibe_family, "👨‍👩‍👧‍👦 亲子友好", ""), 
-            sep = " "),
-      "</p>",
-      "<button onclick='Shiny.setInputValue(\"add_to_route\", \"", dat$id, "\", {priority: \"event\"})' 
-              class='btn btn-primary btn-sm' style='width: 100%; margin-top: 10px;'>
-       添加到行程
-      </button>",
-      "</div>"
-    )
-    
-    leafletProxy("map") |>
-      clearMarkers() |>
-      clearHeatmap() |>
-      addMarkers(
-        data = dat, 
-        lng = ~lon, lat = ~lat, 
-        icon = makeIcon(
-          iconUrl = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIGZpbGw9IiM0Q0E1RjUiIHN0cm9rZT0iI0ZGRkZGRiIgc3Ryb2tlLXdpZHRoPSIyIi8+Cjwvc3ZnPg==",
-          iconWidth = 24, iconHeight = 24
-        ),
-        popup = popup_content,
-        layerId = ~paste0("poi_", id)
-      )
-    
-    # 添加热力图
-    heat_data <- heatmap_data()
-    if (!is.null(heat_data)) {
-      leafletProxy("map") |>
-        addHeatmap(
-          lng = heat_data$lon, 
-          lat = heat_data$lat, 
-          blur = 20, 
-          max = 0.8, 
-          radius = 15,
-          gradient = c("blue", "cyan", "lime", "yellow", "red")
-        )
-    }
-  })
-  
-  # 处理添加到行程
-  observeEvent(input$add_to_route, {
-    poi_id <- as.numeric(input$add_to_route)
-    selected_poi <- poi[poi$id == poi_id, c("name", "lon", "lat", "type")]
-    
-    if (nrow(selected_poi) > 0) {
-      current_route <- route()
-      # 避免重复添加
-      if (!selected_poi$name %in% current_route$name) {
-        route(bind_rows(current_route, selected_poi))
-      }
-    }
-  })
-  
-  # 渲染行程列表
-  observe({
-    r <- route()
-    
-    if (nrow(r) == 0) {
-      html("route_list", "<p style='color: #6c757d; text-align: center; padding: 20px;'>尚未添加地点<br>点击地图标记可加入行程</p>")
-      return()
-    }
-    
-    # 计算步行距离和时间
-    items <- list()
-    total_distance <- 0
-    
-    for (i in seq_len(nrow(r))) {
-      if (i > 1) {
-        dist_m <- geosphere::distHaversine(
-          c(r$lon[i-1], r$lat[i-1]), 
-          c(r$lon[i], r$lat[i])
-        )
-        walk_time <- round(dist_m / 80) # 假设步行速度80米/分钟
-        total_distance <- total_distance + dist_m
-        
-        items[[i]] <- div(
-          class = "route-item",
-          h5(paste(i, ".", r$name[i]), style = "margin: 0; color: #2c3e50;"),
-          p(paste("步行距离:", round(dist_m), "米 (约", walk_time, "分钟)"), 
-            style = "margin: 5px 0; color: #6c757d; font-size: 0.9em;"),
-          p(paste("类型:", r$type[i]), 
-            style = "margin: 0; color: #6c757d; font-size: 0.8em;")
-        )
-      } else {
-        items[[i]] <- div(
-          class = "route-item",
-          h5(paste(i, ".", r$name[i]), style = "margin: 0; color: #2c3e50;"),
-          p(paste("类型:", r$type[i]), 
-            style = "margin: 5px 0; color: #6c757d; font-size: 0.8em;")
-        )
-      }
-    }
-    
-    # 添加总计信息
-    if (nrow(r) > 1) {
-      total_time <- round(total_distance / 80)
-      summary <- div(
-        class = "vibe-card",
-        h5("📊 行程统计", style = "margin: 0 0 10px 0;"),
-        p(paste("总距离:", round(total_distance), "米"), style = "margin: 0;"),
-        p(paste("预计步行时间:", total_time, "分钟"), style = "margin: 0;"),
-        p(paste("地点数量:", nrow(r), "个"), style = "margin: 0;")
-      )
-      items <- c(list(summary), items)
-    }
-    
-    # 在地图上绘制路线
-    if (nrow(r) > 1) {
-      leafletProxy("map") |>
-        clearGroup("route") |>
-        addPolylines(
-          lng = r$lon, 
-          lat = r$lat, 
-          color = "#e74c3c", 
-          weight = 4, 
-          opacity = 0.8, 
-          group = "route"
-        ) |>
-        addMarkers(
-          lng = r$lon, 
-          lat = r$lat,
-          label = paste(seq_len(nrow(r)), r$name),
-          labelOptions = labelOptions(noHide = TRUE, direction = "top"),
-          group = "route"
-        )
-    }
-    
-    html("route_list", items)
-  })
-  
-  # 处理地图点击
-  observeEvent(input$map_marker_click, {
-    click <- input$map_marker_click
-    if (is.null(click$id)) return()
-    
-    if (startsWith(click$id, "poi_")) {
-      poi_id <- as.numeric(sub("poi_", "", click$id))
-      selected_poi <- poi[poi$id == poi_id,]
-      
-      if (nrow(selected_poi) > 0) {
-        # 显示详细信息
-        details <- div(
-          class = "info-card",
-          h4(selected_poi$name, style = "color: #2c3e50; margin: 0 0 15px 0;"),
-          p(paste("📍 类型:", selected_poi$type), style = "margin: 5px 0;"),
-          if (!is.na(selected_poi$capacity)) p(paste("👥 容量:", selected_poi$capacity), style = "margin: 5px 0;") else "",
-          p(paste("🏷️ 氛围标签:"), style = "margin: 10px 0 5px 0; font-weight: bold;"),
-          div(
-            if (selected_poi$vibe_artistic) span("🎨 文艺午后 ", style = "background: #e3f2fd; padding: 2px 8px; border-radius: 12px; margin: 2px; display: inline-block;") else "",
-            if (selected_poi$vibe_foodie) span("🍽️ 美食探索 ", style = "background: #f3e5f5; padding: 2px 8px; border-radius: 12px; margin: 2px; display: inline-block;") else "",
-            if (selected_poi$vibe_historical) span("🏛️ 历史漫步 ", style = "background: #fff3e0; padding: 2px 8px; border-radius: 12px; margin: 2px; display: inline-block;") else "",
-            if (selected_poi$vibe_nightlife) span("🌃 夜生活热点 ", style = "background: #fce4ec; padding: 2px 8px; border-radius: 12px; margin: 2px; display: inline-block;") else "",
-            if (selected_poi$vibe_family) span("👨‍👩‍👧‍👦 亲子友好 ", style = "background: #e8f5e8; padding: 2px 8px; border-radius: 12px; margin: 2px; display: inline-block;") else ""
-          ),
-          p(paste("🏪 街区便利性评分:", round(selected_poi$street_density), "/10"), 
-            style = "margin: 10px 0 5px 0; color: #6c757d;"),
-          actionButton("add_selected_to_route", "➕ 添加到行程", 
-                      class = "btn btn-primary", style = "width: 100%; margin-top: 10px;")
-        )
-        
-        html("poi_details", details)
-        
-        # 自动添加到行程
-        current_route <- route()
-        if (!selected_poi$name %in% current_route$name) {
-          route(bind_rows(current_route, selected_poi[, c("name", "lon", "lat", "type")]))
-          showNotification(paste("已添加", selected_poi$name, "到行程"), type = "success")
-        } else {
-          showNotification("该地点已在行程中", type = "warning")
-        }
-      }
-    }
-  })
-  
-  # 处理添加选中地点到行程
-  observeEvent(input$add_selected_to_route, {
-    # 这里需要获取当前选中的POI信息
-    # 由于UI限制，这里简化处理
-    showNotification("请直接点击地图上的标记添加到行程", type = "info")
-  })
-  
-  # 渲染设施分析图表
-  output$facility_chart <- renderPlotly({
-    # 获取当前过滤的POI数据
     dat <- filtered_poi()
     
     if (nrow(dat) == 0) {
-      # 如果没有数据，显示空图表
-      p <- plot_ly() |>
-        add_annotations(
-          text = "请选择氛围标签查看数据",
-          x = 0.5, y = 0.5,
-          xref = "paper", yref = "paper",
-          showarrow = FALSE,
-          font = list(size = 16, color = "#6c757d")
-        ) |>
-        layout(
-          xaxis = list(showgrid = FALSE, showticklabels = FALSE, zeroline = FALSE),
-          yaxis = list(showgrid = FALSE, showticklabels = FALSE, zeroline = FALSE),
-          plot_bgcolor = "rgba(0,0,0,0)",
-          paper_bgcolor = "rgba(0,0,0,0)"
-        )
-      return(p)
+      html("data_stats", "<p style='color: #6c757d; text-align: center; padding: 10px;'>请选择氛围标签查看数据</p>")
+      return()
     }
     
-    # 统计各类型POI数量
-    type_counts <- dat |>
-      count(type) |>
-      arrange(desc(n))
+    # 计算统计数据
+    total_pois <- nrow(dat)
+    type_counts <- table(dat$type)
+    vibe_counts <- c(
+      sum(dat$vibe_artistic, na.rm = TRUE),
+      sum(dat$vibe_foodie, na.rm = TRUE),
+      sum(dat$vibe_historical, na.rm = TRUE),
+      sum(dat$vibe_nightlife, na.rm = TRUE),
+      sum(dat$vibe_family, na.rm = TRUE)
+    )
+    names(vibe_counts) <- c("文艺午后", "美食探索", "历史漫步", "夜生活热点", "亲子友好")
     
-    # 创建柱状图
-    p <- plot_ly(
-      data = type_counts,
-      x = ~type,
-      y = ~n,
-      type = "bar",
-      marker = list(
-        color = c("#e74c3c", "#8e44ad", "#f39c12", "#2ecc71", "#3498db", "#95a5a6", "#34495e"),
-        line = list(color = "white", width = 1)
-      )
-    ) |>
-    layout(
-      title = list(
-        text = "POI类型分布",
-        font = list(size = 16, color = "#2c3e50")
-      ),
-      xaxis = list(
-        title = "类型",
-        tickangle = -45,
-        titlefont = list(size = 12, color = "#2c3e50")
-      ),
-      yaxis = list(
-        title = "数量",
-        titlefont = list(size = 12, color = "#2c3e50")
-      ),
-      margin = list(l = 50, r = 50, t = 50, b = 100),
-      plot_bgcolor = "rgba(0,0,0,0)",
-      paper_bgcolor = "rgba(0,0,0,0)"
+    
+    # 创建统计显示
+    stats_html <- paste0(
+      "<div style='padding: 10px;'>",
+      "<h5 style='color: #2c3e50; margin-bottom: 10px;'>📊 当前数据统计</h5>",
+      "<p style='margin: 5px 0;'><strong>总POI数量:</strong> ", total_pois, "</p>",
+      "<p style='margin: 5px 0;'><strong>选择区域:</strong> ", 
+      ifelse(input$explore_region == "all", "整个墨尔本", 
+             names(region_bounds)[region_bounds == input$explore_region]), "</p>",
+      "<p style='margin: 5px 0;'><strong>计划时间:</strong> ", input$hour, ":00</p>",
+      "<hr style='margin: 10px 0;'>",
+      "<h6 style='color: #34495e; margin-bottom: 5px;'>🏷️ 氛围标签分布:</h6>",
+      paste(sapply(names(vibe_counts), function(vibe) {
+        if (vibe_counts[vibe] > 0) {
+          paste0("<p style='margin: 2px 0; font-size: 0.9em;'>", vibe, ": ", vibe_counts[vibe], "</p>")
+        } else ""
+      }), collapse = ""),
+      "<hr style='margin: 10px 0;'>",
+      "<h6 style='color: #34495e; margin-bottom: 5px;'>📍 类型分布:</h6>",
+      paste(sapply(names(type_counts), function(type) {
+        paste0("<p style='margin: 2px 0; font-size: 0.9em;'>", type, ": ", type_counts[type], "</p>")
+      }), collapse = ""),
+      "</div>"
     )
     
-    p
+    html("data_stats", stats_html)
   })
+  
+  # 连接或重载Tableau仪表板
+  observeEvent(input$connect_tableau, {
+    session$sendCustomMessage("tableauInit", list(forceReload = TRUE))
+    showNotification("正在连接Tableau仪表板…", type = "message")
+  })
+  
+  # 将Shiny筛选同步到Tableau
+  observeEvent(
+    list(input$main_poi_types, input$explore_region),
+    {
+      session$sendCustomMessage(
+        "tableauFilter",
+        list(
+          poi_types = input$main_poi_types,
+          region = input$explore_region
+        )
+      )
+    },
+    ignoreNULL = FALSE
+  )
+  
+  # 生成Tableau分析报告
+  observeEvent(input$generate_tableau, {
+    dat <- filtered_poi()
+    
+    if (nrow(dat) == 0) {
+      showNotification("请先选择氛围标签查看数据", type = "warning")
+      return()
+    }
+    
+    # 创建Tableau分析报告
+    html("tableau_dashboard", 
+         HTML(paste0(
+           '<div style="padding: 20px; background: white; border-radius: 5px; height: 100%; overflow-y: auto;">
+              <h4 style="color: #2c3e50; margin-bottom: 20px;">📊 Tableau分析报告</h4>
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div>
+                  <h5 style="color: #34495e;">📈 数据概览</h5>
+                  <ul style="list-style: none; padding: 0;">
+                    <li style="margin: 8px 0;"><strong>总POI数量:</strong> ', nrow(dat), '</li>
+                    <li style="margin: 8px 0;"><strong>选择区域:</strong> ', 
+                    ifelse(input$explore_region == "all", "整个墨尔本", input$explore_region), '</li>
+                    <li style="margin: 8px 0;"><strong>计划时间:</strong> ', input$hour, ':00</li>
+                    <li style="margin: 8px 0;"><strong>选择氛围:</strong> ', length(input$vibes), ' 种</li>
+                  </ul>
+                </div>
+                <div>
+                  <h5 style="color: #34495e;">🏷️ 类型分布</h5>
+                  <ul style="list-style: none; padding: 0;">',
+                  paste(sapply(names(table(dat$type)), function(type) {
+                    paste0('<li style="margin: 8px 0;"><strong>', type, ':</strong> ', table(dat$type)[type], '</li>')
+                  }), collapse = ''),
+                  '</ul>
+                </div>
+              </div>
+              <div style="margin-top: 20px; padding: 15px; background: #e3f2fd; border-radius: 5px;">
+                <h5 style="color: #1976d2; margin-bottom: 10px;">💡 Tableau分析建议</h5>
+                <p style="margin: 5px 0; color: #424242;">• 使用经纬度字段创建交互式地图</p>
+                <p style="margin: 5px 0; color: #424242;">• 按氛围标签分类显示不同颜色</p>
+                <p style="margin: 5px 0; color: #424242;">• 使用便利性评分调整标记大小</p>
+                <p style="margin: 5px 0; color: #424242;">• 创建区域对比分析仪表板</p>
+              </div>
+            </div>'
+         )))
+    
+    showNotification("Tableau分析报告已生成", type = "success")
+  })
+  
+  # 数据导出功能
+  observeEvent(input$export_data, {
+    dat <- filtered_poi()
+    
+    if (nrow(dat) == 0) {
+      showNotification("没有数据可导出", type = "warning")
+      return()
+    }
+    
+    # 准备导出数据
+    export_data <- dat |>
+      select(.data$name, .data$type, .data$subtype, .data$lon, .data$lat, .data$capacity, 
+             .data$vibe_artistic, .data$vibe_foodie, .data$vibe_historical, 
+             .data$vibe_nightlife, .data$vibe_family, .data$street_density) |>
+      mutate(
+        # 添加POI类型标识，便于Tableau筛选
+        poi_category = case_when(
+          .data$type == "Cafe" | .data$type == "Restaurant" ~ "Cafe/Restaurant",
+          .data$type == "Bar" | .data$type == "Pub" | .data$type == "Nightclub" ~ "Bar/Nightclub", 
+          .data$type == "Landmark" | .data$type == "Museum" | .data$type == "Gallery" ~ "Landmark",
+          .data$type == "Venue" | .data$type == "Event Space" ~ "Event Venue",
+          .data$type == "Drinking Fountain" ~ "Drinking Fountain",
+          .data$type == "Toilet" ~ "Toilet",
+          TRUE ~ "Other"
+        ),
+        # 添加筛选条件信息
+        export_timestamp = Sys.time(),
+        selected_main_poi_types = paste(input$main_poi_types, collapse = ";"),
+        selected_vibes = paste(input$vibes, collapse = ";"),
+        time_preference = input$hour,
+        explore_region = input$explore_region,
+        # 添加Tableau筛选标识
+        tableau_filter_active = TRUE,
+        tableau_poi_types = paste(input$main_poi_types, collapse = ",")
+      )
+    
+    # 创建下载链接
+    output$download_tableau_data <- downloadHandler(
+      filename = function() {
+        paste0("melbourne_vibe_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv")
+      },
+      content = function(file) {
+        write.csv(export_data, file, row.names = FALSE, fileEncoding = "UTF-8")
+      }
+    )
+    
+    # 显示导出成功信息
+    html("tableau_dashboard", 
+         HTML(paste0(
+           '<div style="padding: 20px; background: white; border-radius: 5px; height: 100%; text-align: center;">
+              <h4 style="color: #2c3e50; margin-bottom: 20px;">✅ 数据导出成功</h4>
+              <div style="background: #e8f5e8; padding: 15px; border-radius: 5px; margin: 20px 0;">
+                <h5 style="color: #2e7d32; margin-bottom: 10px;">📁 导出文件信息</h5>
+                <p style="margin: 5px 0; color: #424242;"><strong>文件名:</strong> melbourne_vibe_data_', format(Sys.time(), "%Y%m%d_%H%M%S"), '.csv</p>
+                <p style="margin: 5px 0; color: #424242;"><strong>记录数:</strong> ', nrow(export_data), ' 条</p>
+                <p style="margin: 5px 0; color: #424242;"><strong>筛选的POI类型:</strong> ', paste(input$main_poi_types, collapse = ", "), '</p>
+                <p style="margin: 5px 0; color: #424242;"><strong>探索区域:</strong> ', input$explore_region, '</p>
+              </div>
+              <div style="background: #fff3e0; padding: 15px; border-radius: 5px; margin: 20px 0;">
+                <h5 style="color: #f57c00; margin-bottom: 10px;">🔗 Tableau集成步骤</h5>
+                <ol style="text-align: left; color: #424242; margin: 10px 0;">
+                  <li>下载CSV数据文件</li>
+                  <li>在Tableau中导入CSV文件</li>
+                  <li>使用<strong>poi_category</strong>字段筛选POI类型</li>
+                  <li>使用<strong>tableau_poi_types</strong>字段匹配筛选条件</li>
+                  <li>创建地图可视化，使用经纬度字段</li>
+                  <li>根据氛围标签设置颜色和大小</li>
+                </ol>
+              </div>
+              <div style="background: #e3f2fd; padding: 15px; border-radius: 5px; margin: 20px 0;">
+                <h5 style="color: #1976d2; margin-bottom: 10px;">🎯 筛选建议</h5>
+                <p style="color: #424242; margin: 5px 0;">在Tableau中使用以下字段进行筛选：</p>
+                <ul style="text-align: left; color: #424242; margin: 10px 0;">
+                  <li><strong>poi_category</strong>: 匹配主要POI类型</li>
+                  <li><strong>tableau_filter_active</strong>: 确保为TRUE</li>
+                  <li><strong>explore_region</strong>: 按区域筛选</li>
+                </ul>
+              </div>
+              <button onclick="Shiny.setInputValue(\'download_tableau_data\', \'download\', {priority: \'event\'})" 
+                      class="btn btn-success" style="margin-top: 10px;">
+                📥 下载数据文件
+              </button>
+            </div>'
+         )))
+    
+    showNotification("数据已准备就绪，可下载导入Tableau", type = "success")
+  })
+
 }
 
 # ---------- 启动应用 ----------
